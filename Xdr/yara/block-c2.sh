@@ -20,7 +20,7 @@ log_json() {
 # --- read alert JSON from stdin (robust: jq -> python3 -> grep fallback) ---
 ALERT=""
 if [ ! -t 0 ]; then
-  ALERT=$(cat)
+  read -r -t 2 ALERT
 fi
 extract() {
   local key="$1" val=""
