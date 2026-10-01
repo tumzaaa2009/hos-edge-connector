@@ -1,1 +1,0 @@
-hos-edge-connector/Xdr/yara/isolate-host.sh
