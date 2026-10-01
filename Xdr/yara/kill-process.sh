@@ -30,6 +30,23 @@ if [ "$COMMAND" = "add" ]; then
         echo "$(date '+%Y-%m-%dT%H:%M:%S%z') kill-process.sh: Safeguard: Skipped killing protected core/HIS process PID $PROCID ($PCOMM)." >> "$LOG_FILE" 2>/dev/null || true
         exit 0
     fi
+
+    # Verified Kill Safeguard: Prevent PID Reuse / Recycling
+    if [ -n "$IMAGE" ] && [ "$IMAGE" != "null" ]; then
+        EXPECTED_NAME=$(basename "$IMAGE")
+        CUR_COMM=$(ps -p "$PROCID" -o comm= 2>/dev/null || true)
+        CUR_EXE=$(readlink -f "/proc/$PROCID/exe" 2>/dev/null | xargs basename 2>/dev/null || true)
+        if [ -n "$CUR_COMM" ] && [ "$CUR_COMM" != "$EXPECTED_NAME" ] && [ "$CUR_EXE" != "$EXPECTED_NAME" ]; then
+            echo "$(date '+%Y-%m-%dT%H:%M:%S%z') kill-process.sh: Safeguard: PID $PROCID ($CUR_COMM) does not match alert executable ($EXPECTED_NAME) — suspected PID reuse. Kill aborted." >> "$LOG_FILE" 2>/dev/null || true
+            exit 0
+        fi
+    fi
+
+    # Pre-kill Triage & Socket Evidence Capture
+    if command -v ss >/dev/null 2>&1; then
+        NET_CONNS=$(ss -tnp 2>/dev/null | grep -E "pid=$PROCID," | awk '{print $5}' | tr '\n' ',' | sed 's/,$//')
+        [ -n "$NET_CONNS" ] && echo "$(date '+%Y-%m-%dT%H:%M:%S%z') kill-process.sh: Triage Evidence: PID $PROCID sockets: [$NET_CONNS]" >> "$LOG_FILE" 2>/dev/null || true
+    fi
     
     kill -9 "$PROCID" 2>/dev/null
     if [ $? -eq 0 ]; then
