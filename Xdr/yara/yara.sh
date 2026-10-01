@@ -184,15 +184,32 @@ if [ -n "$CLEAN_YARA_RESULT" ] && [ "$EXIT_CODE" -eq 0 ]; then
     logger -p local6.notice -t wazuh_yara -- \
     "{\"event\":\"yara\",\"action\":\"detect\",\"level\":\"INFO\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\",\"src_ip\":\"$SRC_IP\",\"user\":\"$DETECT_USER\"}"
 
-    rm -f "$ABS_FILE"
-
-    if [ ! -f "$ABS_FILE" ]; then
-        echo "$(date -Is) yara.sh: [DEBUG] File successfully deleted." >> "$LOGFILE"
-        echo "$(date -Is) wazuh-yara: src=$ABS_FILE dest=DELETED sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT src_ip=$SRC_IP user=$DETECT_USER cdb_format=$SHA256:$YARA_CLEAN_FORMAT" >> "$LOGFILE"
+    # Critical OS / Infrastructure Protection: Refuse to delete core system binaries
+    if [[ "$ABS_FILE" =~ ^/(bin|sbin|lib|lib64|usr/bin|usr/sbin|etc/passwd|etc/shadow|etc/sudoers|var/ossec/bin) ]]; then
+        echo "$(date -Is) yara.sh: [WARN] Refusing to quarantine core system path: $ABS_FILE" >> "$LOGFILE"
+        logger -p local6.warn -t wazuh_yara -- \
+        "{\"event\":\"yara\",\"action\":\"quarantine_skipped\",\"level\":\"WARN\",\"reason\":\"protected_system_path\",\"file\":\"$ABS_FILE\"}"
     else
-        echo "$(date -Is) yara.sh: [ERROR] Failed to delete file." >> "$LOGFILE"
-        logger -p local6.err -t wazuh_yara -- \
-        "{\"event\":\"yara\",\"action\":\"delete_failed\",\"level\":\"ERROR\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\",\"src_ip\":\"$SRC_IP\",\"user\":\"$DETECT_USER\"}"
+        # Safe Quarantine: Move to /var/ossec/quarantine/ with 0000 permissions (Reversible, Forensic-ready)
+        QUARANTINE_DIR="/var/ossec/quarantine"
+        mkdir -p "$QUARANTINE_DIR" 2>/dev/null
+        chmod 700 "$QUARANTINE_DIR" 2>/dev/null
+        TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+        DEST="$QUARANTINE_DIR/${TIMESTAMP}_${FILENAME}"
+
+        mv -f "$ABS_FILE" "$DEST" 2>/dev/null
+        chmod 0000 "$DEST" 2>/dev/null
+
+        if [ -f "$DEST" ] && [ ! -f "$ABS_FILE" ]; then
+            echo "$(date -Is) yara.sh: [DEBUG] File safely quarantined to $DEST" >> "$LOGFILE"
+            echo "$(date -Is) wazuh-yara: src=$ABS_FILE dest=$DEST sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT src_ip=$SRC_IP user=$DETECT_USER cdb_format=$SHA256:$YARA_CLEAN_FORMAT" >> "$LOGFILE"
+            logger -p local6.notice -t wazuh_yara -- \
+            "{\"event\":\"yara\",\"action\":\"quarantined\",\"level\":\"INFO\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"src\":\"$ABS_FILE\",\"dest\":\"$DEST\",\"sha256\":\"$SHA256\"}"
+        else
+            echo "$(date -Is) yara.sh: [ERROR] Failed to quarantine file." >> "$LOGFILE"
+            logger -p local6.err -t wazuh_yara -- \
+            "{\"event\":\"yara\",\"action\":\"quarantine_failed\",\"level\":\"ERROR\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\",\"src_ip\":\"$SRC_IP\",\"user\":\"$DETECT_USER\"}"
+        fi
     fi
 
 else
