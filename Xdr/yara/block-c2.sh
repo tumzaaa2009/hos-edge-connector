@@ -20,7 +20,7 @@ log_json() {
 # --- read alert JSON from stdin (robust: jq -> python3 -> grep fallback) ---
 ALERT=""
 if [ ! -t 0 ]; then
-  ALERT=$(timeout 10 cat)
+  read -r -t 2 ALERT
 fi
 extract() {
   local key="$1" val=""
@@ -33,9 +33,6 @@ extract() {
       first(cands[] as $c
             | (.parameters.alert[$c]
                // .parameters.alert.data[$c]
-               // .parameters.alert.data.data[$c]
-               // (.parameters.alert.data.alert.source.ip // empty | if $k=="srcip" then . else empty end)
-               // (.parameters.alert.data.alert.target.ip // empty | if $k=="dstip" then . else empty end)
                // empty)
             | if $k=="rule" and (type=="object") then .id else . end)
       // empty' 2>/dev/null | head -1)
@@ -44,20 +41,13 @@ extract() {
 import sys, json
 try:
     a=json.load(sys.stdin).get('parameters',{}).get('alert',{})
-    d=a.get('data',{}) if isinstance(a.get('data',{}),dict) else {}
-    dd=d.get('data',{}) if isinstance(d.get('data',{}),dict) else {}
-    alert_obj=d.get('alert',{}) if isinstance(d.get('alert',{}),dict) else {}
     aliases={'srcip':['srcip','src_ip'],'dstip':['dstip','dest_ip','dst_ip'],'rule':['rule','rule_id']}.get('$key',['$key'])
     v=''
     for kk in aliases:
-        x=a.get(kk) or d.get(kk) or dd.get(kk)
+        x=a.get(kk) or a.get('data',{}).get(kk)
         if x:
             v = x.get('id','') if isinstance(x,dict) else x
             break
-    if not v and '$key'=='srcip':
-        v = alert_obj.get('source',{}).get('ip','') if isinstance(alert_obj.get('source',{}),dict) else ''
-    if not v and '$key'=='dstip':
-        v = alert_obj.get('target',{}).get('ip','') if isinstance(alert_obj.get('target',{}),dict) else ''
     print(v if v else '')
 except Exception: print('')
 " 2>/dev/null)
@@ -68,8 +58,10 @@ except Exception: print('')
 }
 
 SRCIP=$(extract srcip)
+[ -z "$SRCIP" ] && SRCIP="${3:-}"
 DSTIP=$(extract dstip)
 RULEID=$(extract rule)
+[ -z "$RULEID" ] && RULEID="AR_DROP"
 ACTION=${1:-add}
 log_start
 
@@ -165,11 +157,14 @@ if command -v iptables >/dev/null 2>&1; then
 elif command -v nft >/dev/null 2>&1; then
   nft add table inet soc_block 2>/dev/null
   nft add chain inet soc_block output '{ type filter hook output priority -150; }' 2>/dev/null
+  nft add set inet soc_block blocked_ips '{ type ipv4_addr; }' 2>/dev/null
+  nft add rule inet soc_block output ip daddr @blocked_ips drop 2>/dev/null
   if [ "$ACTION" = "add" ]; then
-    nft add rule inet soc_block output ip daddr "$BLOCKIP" drop
+    nft add element inet soc_block blocked_ips { "$BLOCKIP" } 2>/dev/null
     log_json "${ACTION}" "${BLOCKIP}" "${RULEID}" "BLOCKED"
   else
-    log_json "delete" "${BLOCKIP}" "${RULEID}" "ERROR"
+    nft delete element inet soc_block blocked_ips { "$BLOCKIP" } 2>/dev/null
+    log_json "${ACTION}" "${BLOCKIP}" "${RULEID}" "UNBLOCKED"
   fi
 else
   log_json "${ACTION}" "${BLOCKIP}" "${RULEID}" "ERROR"
