@@ -48,13 +48,7 @@ try {
     exit 0
 }
 
-$logFile = "$env:ProgramFiles(x86)\ossec-agent\active-response\active-responses.log"
-if (-not (Test-Path -Path (Split-Path -Path $logFile -Parent))) {
-    $logFile = "$env:ProgramFiles\ossec-agent\active-response\active-responses.log"
-}
-if (-not (Test-Path -Path (Split-Path -Path $logFile -Parent))) {
-    $logFile = "$env:ProgramData\ossec-agent\active-response\active-responses.log"
-}
+$logFile = "C:\Program Files (x86)\ossec-agent\active-response\active-responses.log"
 $command = $INPUT_ARRAY."command"
 
 $localIPs = @()
