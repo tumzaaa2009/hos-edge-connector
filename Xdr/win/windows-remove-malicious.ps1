@@ -107,7 +107,8 @@ $threatLabel = "Malicious IOC"
 
 # Candidate paths for misp_hash.txt synced from Manager
 $mispCandidates = @(
-    "$env:ProgramFiles(x86)\ossec-agent\shared\misp_hash.txt",
+    "${env:ProgramFiles(x86)}\ossec-agent\shared\misp_hash.txt",
+    "C:\Program Files (x86)\ossec-agent\shared\misp_hash.txt",
     "$env:ProgramFiles\ossec-agent\shared\misp_hash.txt",
     "$env:ProgramData\ossec-agent\shared\misp_hash.txt",
     (Join-Path (Split-Path $PSScriptRoot -Parent) "shared\misp_hash.txt"),
