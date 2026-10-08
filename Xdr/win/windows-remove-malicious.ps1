@@ -8,29 +8,20 @@
 
 $ErrorActionPreference = "SilentlyContinue"
 
-$logCandidates = @(
-    (Join-Path (Split-Path $PSScriptRoot -Parent) "active-responses.log"),
-    "$env:ProgramFiles\ossec-agent\active-response\active-responses.log",
-    "$env:ProgramData\ossec-agent\active-response\active-responses.log"
-)
-$logFile = $logCandidates | Where-Object { Test-Path (Split-Path $_ -Parent) } | Select-Object -First 1
+$logFile = "$env:ProgramFiles(x86)\ossec-agent\active-response\active-responses.log"
+if (-not (Test-Path -Path (Split-Path -Path $logFile -Parent))) {
+    $logFile = "$env:ProgramFiles\ossec-agent\active-response\active-responses.log"
+}
+if (-not (Test-Path -Path (Split-Path -Path $logFile -Parent))) {
+    $logFile = "$env:ProgramData\ossec-agent\active-response\active-responses.log"
+}
 
 function Write-ARLog($msg) {
     $timestamp = Get-Date -Format 'yyyy/MM/dd HH:mm:ss'
-    $line = "$timestamp active-response/bin/windows-remove-malicious.cmd: $msg"
-    try {
-        $stream = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-        $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
-        $writer.WriteLine($line)
-        $writer.Flush()
-        $writer.Close()
-        $stream.Close()
-    } catch {
-        try { Add-Content -Path "$env:ProgramData\ossec-agent\active-response\active-responses.log" -Value $line -Encoding utf8 } catch {}
-    }
+    Add-Content -Path $logFile -Value "$timestamp active-response/bin/windows-remove-malicious.cmd: $msg" -Encoding utf8
 }
 
-# 1. Read JSON from STDIN
+# ─── 1. Read JSON from STDIN ───────────────────────────────────────────────
 $inputJson = [Console]::In.ReadLine()
 if ([string]::IsNullOrWhiteSpace($inputJson)) {
     $inputJson = Read-Host
@@ -46,7 +37,7 @@ try {
     exit 0
 }
 
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 2. Extract Target File Path from Alert Payload Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# ─── 2. Extract Target File Path from Alert Payload ────────────────────────
 $targetPath = $null
 
 # Priority 1: FIM Syscheck
@@ -91,7 +82,7 @@ if (-not (Test-Path -LiteralPath $targetPath)) {
     exit 0
 }
 
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 3. Calculate Cryptographic Hashes Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# ─── 3. Calculate Cryptographic Hashes ─────────────────────────────────────
 try {
     $computedSha256 = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
     $computedMd5 = (Get-FileHash -LiteralPath $targetPath -Algorithm MD5 -ErrorAction Stop).Hash.ToLower()
@@ -100,15 +91,14 @@ try {
     exit 1
 }
 
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 4. Hash Verification against MISP Database Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# ─── 4. Hash Verification against MISP Database ───────────────────────────
 # Deletion MUST match hash only.
 $hashMatched = $false
 $threatLabel = "Malicious IOC"
 
 # Candidate paths for misp_hash.txt synced from Manager
 $mispCandidates = @(
-    "${env:ProgramFiles(x86)}\ossec-agent\shared\misp_hash.txt",
-    "C:\Program Files (x86)\ossec-agent\shared\misp_hash.txt",
+    "$env:ProgramFiles(x86)\ossec-agent\shared\misp_hash.txt",
     "$env:ProgramFiles\ossec-agent\shared\misp_hash.txt",
     "$env:ProgramData\ossec-agent\shared\misp_hash.txt",
     (Join-Path (Split-Path $PSScriptRoot -Parent) "shared\misp_hash.txt"),
@@ -132,7 +122,7 @@ if ($mispFile) {
 # Fallback check: Did the alert itself originate from a confirmed hash rule?
 if (-not $hashMatched) {
     $ruleId = [string]$data.parameters.alert.rule.id
-    $confirmedHashRules = @('100300', '100301', '120024', '120025', '120064')
+    $confirmedHashRules = @('100055', '100056', '100057', '100300', '100301', '120021', '120024', '120025', '120064')
     if ($ruleId -in $confirmedHashRules) {
         # Rule itself already confirmed hash in Wazuh manager
         $hashMatched = $true
@@ -154,7 +144,7 @@ if (-not $hashMatched) {
     exit 0
 }
 
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 5. Terminate Any Process Locking the Target File Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# ─── 5. Terminate Any Process Locking the Target File ──────────────────────
 try {
     $targetLeaf = [System.IO.Path]::GetFileName($targetPath).ToLower()
     $runningProcs = Get-Process | Where-Object {
@@ -168,7 +158,7 @@ try {
     }
 } catch {}
 
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 6. Delete the Malicious File Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# ─── 6. Delete the Malicious File ──────────────────────────────────────────
 try {
     # Clear read-only/hidden attributes if present
     Set-ItemProperty -LiteralPath $targetPath -Name Attributes -Value ([System.IO.FileAttributes]::Normal) -ErrorAction SilentlyContinue
@@ -176,15 +166,7 @@ try {
 
     # Verify removal
     if (-not (Test-Path -LiteralPath $targetPath)) {
-        $threatClean = if ($threatLabel -match ':(.+)$') { $matches[1] } else { $threatLabel }
-        $arJson = @{
-            file = $targetPath
-            sha256 = $computedSha256
-            md5 = $computedMd5
-            threat_name = $threatClean
-            status = "removed"
-        } | ConvertTo-Json -Compress
-        Write-ARLog $arJson
+        Write-ARLog "Successfully removed threat $targetPath"
         exit 0
     } else {
         Write-ARLog "Error removing threat $targetPath (file still exists after delete attempt)"
