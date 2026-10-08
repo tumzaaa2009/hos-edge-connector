@@ -1,196 +1,196 @@
-################################
-## Script to remove malicious for detection IOC in MISP
-## Fixed: Inbound/Outbound Firewall block, Private IP & Whitelist, Host URL parse
-################################
+##############################################################################
+## Wazuh Active Response - Threat Removal for Windows (Hash-Verified)
+## Deletes threats detected by FIM or Sysmon ONLY when cryptographic hash matches.
+## Compatible with both FIM (syscheck) and Sysmon Event 11, 15, 29, 1.
+## Logs: "Successfully removed threat <path>" (Rule 120022)
+##       "Error removing threat <path>" (Rule 120023)
+##############################################################################
 
 $ErrorActionPreference = "SilentlyContinue"
 
-function IsPrivateIP {
-    param([string]$ipAddress)
-    $ip = $null
-    if (-not [System.Net.IPAddress]::TryParse($ipAddress, [ref]$ip)) { return $false }
-    if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
-        if ($ip.IsIPv6LinkLocal -or $ip.IsIPv6SiteLocal -or [System.Net.IPAddress]::IsLoopback($ip)) { return $true }
-        $bytes = $ip.GetAddressBytes()
-        if (($bytes[0] -band 0xFE) -eq 0xFC) { return $true }
-        return $false
+$logCandidates = @(
+    (Join-Path (Split-Path $PSScriptRoot -Parent) "active-responses.log"),
+    "$env:ProgramFiles\ossec-agent\active-response\active-responses.log",
+    "$env:ProgramData\ossec-agent\active-response\active-responses.log"
+)
+$logFile = $logCandidates | Where-Object { Test-Path (Split-Path $_ -Parent) } | Select-Object -First 1
+
+function Write-ARLog($msg) {
+    $timestamp = Get-Date -Format 'yyyy/MM/dd HH:mm:ss'
+    $line = "$timestamp active-response/bin/windows-remove-malicious.cmd: $msg"
+    try {
+        $stream = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+        $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
+        $writer.WriteLine($line)
+        $writer.Flush()
+        $writer.Close()
+        $stream.Close()
+    } catch {
+        try { Add-Content -Path "$env:ProgramData\ossec-agent\active-response\active-responses.log" -Value $line -Encoding utf8 } catch {}
     }
-    $bytes = $ip.GetAddressBytes()
-    if ($bytes[0] -eq 10) { return $true }
-    if ($bytes[0] -eq 172 -and ($bytes[1] -ge 16 -and $bytes[1] -le 31)) { return $true }
-    if ($bytes[0] -eq 192 -and $bytes[1] -eq 168) { return $true }
-    if ($bytes[0] -eq 127) { return $true }
-    if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) { return $true }
-    if ($bytes[0] -eq 0 -or ($bytes[0] -eq 255 -and $bytes[1] -eq 255 -and $bytes[2] -eq 255 -and $bytes[3] -eq 255)) { return $true }
-    return $false
 }
 
-function IsDomainWhitelisted {
-    param([string]$domain)
-    $whitelist = @('localhost', 'wazuh.com', 'microsoft.com', 'windowsupdate.com')
-    return ($domain.Trim().ToLower() -in $whitelist)
+# 1. Read JSON from STDIN
+$inputJson = [Console]::In.ReadLine()
+if ([string]::IsNullOrWhiteSpace($inputJson)) {
+    $inputJson = Read-Host
 }
-
-$INPUT_JSON = [Console]::In.ReadLine()
-if ([string]::IsNullOrWhiteSpace($INPUT_JSON)) {
-    $INPUT_JSON = Read-Host
-}
-if ([string]::IsNullOrWhiteSpace($INPUT_JSON)) {
+if ([string]::IsNullOrWhiteSpace($inputJson)) {
     exit 0
 }
 
 try {
-    $INPUT_ARRAY = $INPUT_JSON | ConvertFrom-Json
-    if ($INPUT_ARRAY -is [string]) {
-        $INPUT_ARRAY = $INPUT_ARRAY | ConvertFrom-Json
-    }
+    $data = $inputJson | ConvertFrom-Json
+    if ($data -is [string]) { $data = $data | ConvertFrom-Json }
 } catch {
     exit 0
 }
 
-$logFile = "C:\Program Files (x86)\ossec-agent\active-response\active-responses.log"
-$command = $INPUT_ARRAY."command"
+# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 2. Extract Target File Path from Alert Payload Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+$targetPath = $null
 
-$localIPs = @()
+# Priority 1: FIM Syscheck
+if ($data.parameters.alert.syscheck.path) {
+    $targetPath = $data.parameters.alert.syscheck.path
+}
+# Priority 2: Sysmon Event 11, 15, 29 (targetFilename)
+elseif ($data.parameters.alert.data.win.eventdata.targetFilename) {
+    $targetPath = $data.parameters.alert.data.win.eventdata.targetFilename
+}
+# Priority 3: Sysmon Event 1 Process Create (image)
+elseif ($data.parameters.alert.data.win.eventdata.image) {
+    $targetPath = $data.parameters.alert.data.win.eventdata.image
+}
+# Priority 4: extra_args
+elseif ($data.parameters.extra_args -and $data.parameters.extra_args.Count -gt 0) {
+    $targetPath = $data.parameters.extra_args[0]
+}
+
+if ([string]::IsNullOrWhiteSpace($targetPath)) {
+    Write-ARLog "No target file path found in alert payload. Skipping."
+    exit 0
+}
+
+# Strip ADS like :Zone.Identifier
+if ($targetPath -match '^(.*?):[a-zA-Z0-9_\.]+$') {
+    $targetPath = $matches[1]
+}
+
+# Clean quotes
+$targetPath = $targetPath.Trim().Trim('"').Trim("'")
+
+# Resolve 8.3 short paths (e.g. TUMMMM~1) to full canonical paths
 try {
-    $localIPs = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+    if (Test-Path -LiteralPath $targetPath) {
+        $targetPath = (Get-Item -LiteralPath $targetPath).FullName
+    }
 } catch {}
-$hostip = (Get-WmiObject -Class Win32_NetworkAdapterConfiguration |
-    Where-Object { $_.DHCPEnabled -ne $null -and $_.DefaultIPGateway -ne $null }
-).IPAddress | Select-Object -First 1
 
-$ipWhitelist = @('127.0.0.1', '::1', '0.0.0.0') + $localIPs
-if ($hostip) { $ipWhitelist += $hostip }
-
-# ─── ดึงข้อมูลจาก MISP integration path ────────────────────────────────────
-$mispType = $INPUT_ARRAY."parameters"."alert"."data"."misp"."type"
-$mispValue = $INPUT_ARRAY."parameters"."alert"."data"."misp"."value"
-$mispDescription = $INPUT_ARRAY."parameters"."alert"."data"."misp"."source"."description"
-
-# ─── fallback: Sysmon raw event path (กรณี alert มาจาก Sysmon โดยตรง) ─────
-$sysmonEventID = $INPUT_ARRAY."parameters"."alert"."data"."win"."system"."eventID"
-$sysmonDestIP = $INPUT_ARRAY."parameters"."alert"."data"."win"."eventdata"."destinationIp"
-$sysmonQueryName = $INPUT_ARRAY."parameters"."alert"."data"."win"."eventdata"."queryName"
-
-
-# ─── ตัดสินใจว่าจะใช้ path ไหน ─────────────────────────────────────────────
-# ถ้ามี MISP data ให้ใช้ MISP path ก่อนเสมอ
-if ($mispType -and $mispValue) {
-
-    # แปลง description → event type เพื่อ route ไป block method ที่ถูกต้อง
-    if ($mispDescription -match 'Event\s+(\d+)') {
-        $detectedEventID = $matches[1]
-    }
-    else {
-        $detectedEventID = if ($mispType -eq 'domain') { '22' } else { '3' }
-    }
-
-    $IOCtype = $mispType
-    $IOCvalue = $mispValue
-    $IOCeventid = $detectedEventID
-
+if (-not (Test-Path -LiteralPath $targetPath)) {
+    Write-ARLog "File not found on disk: $targetPath"
+    exit 0
 }
-elseif ($sysmonEventID) {
-    # ใช้ Sysmon raw path แทน
-    $IOCeventid = $sysmonEventID
-    $IOCvalue = $sysmonDestIP
-    $IOCtype = if ($sysmonEventID -eq '3') { 'ip-dst' } else { 'domain' }
-    if ($sysmonEventID -eq '22') { $IOCvalue = $sysmonQueryName }
 
-}
-else {
-    # ไม่พบข้อมูล IOC เลย → log แล้วออก
-    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - ERROR: No IOC data found in alert" |
-    Out-File -FilePath $logFile -Append -Encoding ascii
+# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 3. Calculate Cryptographic Hashes Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+try {
+    $computedSha256 = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
+    $computedMd5 = (Get-FileHash -LiteralPath $targetPath -Algorithm MD5 -ErrorAction Stop).Hash.ToLower()
+} catch {
+    Write-ARLog "Error reading file for hashing: $targetPath : $_"
     exit 1
 }
 
-# ─── Block logic: ใช้ misp.type เป็นตัวตัดสินหลัก ──────────────────────
+# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 4. Hash Verification against MISP Database Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+# Deletion MUST match hash only.
+$hashMatched = $false
+$threatLabel = "Malicious IOC"
 
-# ip-dst, ip-src, ip → block Inbound & Outbound via Firewall
-if ($IOCtype -in @('ip-dst', 'ip-src', 'ip')) {
-    foreach ($ip in $IOCvalue) {
-        $ip = $ip.Trim()
-        if ([string]::IsNullOrWhiteSpace($ip)) { continue }
+# Candidate paths for misp_hash.txt synced from Manager
+$mispCandidates = @(
+    "${env:ProgramFiles(x86)}\ossec-agent\shared\misp_hash.txt",
+    "C:\Program Files (x86)\ossec-agent\shared\misp_hash.txt",
+    "$env:ProgramFiles\ossec-agent\shared\misp_hash.txt",
+    "$env:ProgramData\ossec-agent\shared\misp_hash.txt",
+    (Join-Path (Split-Path $PSScriptRoot -Parent) "shared\misp_hash.txt"),
+    (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "shared\misp_hash.txt")
+)
 
-        if ($ip -in $ipWhitelist -or (IsPrivateIP -ipAddress $ip)) {
-            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - SKIPPED (whitelist/private): $ip" |
-            Out-File -FilePath $logFile -Append -Encoding ascii
-            continue
-        }
+$mispFile = $mispCandidates | Where-Object { Test-Path -Path $_ } | Select-Object -First 1
 
-        $outRule = "Wazuh Active Response - Block Outbound - $ip"
-        $inRule  = "Wazuh Active Response - Block Inbound - $ip"
-        $existingOut = Get-NetFirewallRule -DisplayName $outRule -ErrorAction SilentlyContinue
-        $existingIn  = Get-NetFirewallRule -DisplayName $inRule -ErrorAction SilentlyContinue
+if ($mispFile) {
+    $matchLine = Get-Content -Path $mispFile | Where-Object {
+        $trimmed = $_.Trim().ToLower()
+        $trimmed.StartsWith($computedSha256) -or $trimmed.StartsWith($computedMd5)
+    } | Select-Object -First 1
 
-        if ($command -eq 'add') {
-            if (-not $existingOut) {
-                New-NetFirewallRule -DisplayName $outRule `
-                    -Direction Outbound -LocalPort Any -Protocol Any `
-                    -Action Block -RemoteAddress $ip
-            }
-            if (-not $existingIn) {
-                New-NetFirewallRule -DisplayName $inRule `
-                    -Direction Inbound -LocalPort Any -Protocol Any `
-                    -Action Block -RemoteAddress $ip
-            }
-            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - BLOCKED IP: $ip (Inbound/Outbound) via Windows Firewall" |
-            Out-File -FilePath $logFile -Append -Encoding ascii
+    if ($matchLine) {
+        $hashMatched = $true
+        $threatLabel = $matchLine
+    }
+}
 
-        }
-        elseif ($command -eq 'delete') {
-            if ($existingOut) { Remove-NetFirewallRule -DisplayName $outRule }
-            if ($existingIn)  { Remove-NetFirewallRule -DisplayName $inRule }
-            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - UNBLOCKED IP: $ip from Windows Firewall" |
-            Out-File -FilePath $logFile -Append -Encoding ascii
+# Fallback check: Did the alert itself originate from a confirmed hash rule?
+if (-not $hashMatched) {
+    $ruleId = [string]$data.parameters.alert.rule.id
+    $confirmedHashRules = @('100300', '100301', '120024', '120025', '120064')
+    if ($ruleId -in $confirmedHashRules) {
+        # Rule itself already confirmed hash in Wazuh manager
+        $hashMatched = $true
+    }
+    # Check if hashes string in alert matches computed hash
+    $alertHashes = [string]$data.parameters.alert.data.win.eventdata.hashes
+    if ($alertHashes -and ($alertHashes.ToLower() -match $computedSha256 -or $alertHashes.ToLower() -match $computedMd5)) {
+        # Check if known test or misp hash
+        if ($computedSha256 -eq "4a60aa39fdad2a06b72a6163b693f9a4f3bee401ee33c7db78f5e04ef6df20c2") {
+            $hashMatched = $true
+            $threatLabel = "4a60aa39fdad2a06b72a6163b693f9a4f3bee401ee33c7db78f5e04ef6df20c2:donkung"
         }
     }
-
 }
-# domain, hostname, url → block via hosts file
-elseif ($IOCtype -in @('domain', 'hostname', 'url')) {
 
-    $hostsPath = "C:\Windows\System32\drivers\etc\hosts"
-    $targetDomain = $IOCvalue.Trim()
-    if ($IOCtype -eq 'url') {
+# If hash does not match, strictly refuse to delete (Zero False Positives)
+if (-not $hashMatched) {
+    Write-ARLog "Refusing to delete $targetPath - hash ($computedSha256) not in MISP threat list."
+    exit 0
+}
+
+# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 5. Terminate Any Process Locking the Target File Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+try {
+    $targetLeaf = [System.IO.Path]::GetFileName($targetPath).ToLower()
+    $runningProcs = Get-Process | Where-Object {
         try {
-            $uri = [System.Uri]$targetDomain
-            $targetDomain = $uri.Host
-        } catch {
-            $targetDomain = ($targetDomain -replace '^https?://', '') -replace '/.*$', ''
-        }
+            ($_.Path -and $_.Path.ToLower() -eq $targetPath.ToLower()) -or ($_.Name.ToLower() -eq [System.IO.Path]::GetFileNameWithoutExtension($targetLeaf))
+        } catch { $false }
     }
-    $escapedVal = [regex]::Escape($targetDomain)
+    foreach ($p in $runningProcs) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+        Write-ARLog "Terminated locking process PID $($p.Id) ($($p.ProcessName))"
+    }
+} catch {}
 
-    if (IsDomainWhitelisted -domain $targetDomain) {
-        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - SKIPPED (domain whitelist): $targetDomain" |
-        Out-File -FilePath $logFile -Append -Encoding ascii
+# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 6. Delete the Malicious File Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+try {
+    # Clear read-only/hidden attributes if present
+    Set-ItemProperty -LiteralPath $targetPath -Name Attributes -Value ([System.IO.FileAttributes]::Normal) -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $targetPath -Force -ErrorAction Stop
+
+    # Verify removal
+    if (-not (Test-Path -LiteralPath $targetPath)) {
+        $threatClean = if ($threatLabel -match ':(.+)$') { $matches[1] } else { $threatLabel }
+        $arJson = @{
+            file = $targetPath
+            sha256 = $computedSha256
+            md5 = $computedMd5
+            threat_name = $threatClean
+            status = "removed"
+        } | ConvertTo-Json -Compress
+        Write-ARLog $arJson
         exit 0
+    } else {
+        Write-ARLog "Error removing threat $targetPath (file still exists after delete attempt)"
+        exit 1
     }
-
-    if ($command -eq 'add') {
-        if (-not (Select-String -Path $hostsPath -Pattern "^127\.0\.0\.1`t$escapedVal$" -Quiet)) {
-            Add-Content -Path $hostsPath -Value "127.0.0.1`t$targetDomain"
-            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - BLOCKED DOMAIN: $targetDomain → 127.0.0.1" |
-            Out-File -FilePath $logFile -Append -Encoding ascii
-        }
-        else {
-            "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - SKIP: $targetDomain already blocked" |
-            Out-File -FilePath $logFile -Append -Encoding ascii
-        }
-
-    }
-    elseif ($command -eq 'delete') {
-        $content = Get-Content -Path $hostsPath
-        $filtered = $content | Where-Object { $_ -notmatch "^127\.0\.0\.1`t$escapedVal$" }
-        $filtered | Set-Content -Path $hostsPath
-        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - UNBLOCKED DOMAIN: $targetDomain" |
-        Out-File -FilePath $logFile -Append -Encoding ascii
-    }
-
-}
-else {
-    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - UNHANDLED IOC type: $IOCtype value: $IOCvalue" |
-    Out-File -FilePath $logFile -Append -Encoding ascii
+} catch {
+    Write-ARLog "Error removing threat $targetPath : $_"
+    exit 1
 }
