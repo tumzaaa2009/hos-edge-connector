@@ -1,56 +1,136 @@
 ##############################################################################
 ## Wazuh Active Response - Threat Removal for Windows (Hash-Verified)
 ## Deletes threats detected by FIM or Sysmon ONLY when cryptographic hash matches.
-## Compatible with both FIM (syscheck) and Sysmon Event 11, 15, 29, 1.
-## Logs: "Successfully removed threat <path>" (Rule 120022)
-##       "Error removing threat <path>" (Rule 120023)
+## Compatible with both FIM (syscheck) and Sysmon Event 1, 11, 15, 26, 29.
+## Logs: "Successfully removed threat <path>" (Rule 120022 / 120033)
+##       "Error removing threat <path>" (Rule 120023 / 120034)
 ##############################################################################
 
 $ErrorActionPreference = "SilentlyContinue"
 
-$logFile = "$env:ProgramFiles(x86)\ossec-agent\active-response\active-responses.log"
-if (-not (Test-Path -Path (Split-Path -Path $logFile -Parent))) {
-    $logFile = "$env:ProgramFiles\ossec-agent\active-response\active-responses.log"
-}
-if (-not (Test-Path -Path (Split-Path -Path $logFile -Parent))) {
-    $logFile = "$env:ProgramData\ossec-agent\active-response\active-responses.log"
-}
+$Global:ARLogPath = "C:\Program Files (x86)\ossec-agent\active-response\active-responses.log"
 
 function Write-ARLog($msg) {
-    $timestamp = Get-Date -Format 'yyyy/MM/dd HH:mm:ss'
-    Add-Content -Path $logFile -Value "$timestamp active-response/bin/windows-remove-malicious.cmd: $msg" -Encoding utf8
+    try {
+        $timestamp = Get-Date -Format 'yyyy/MM/dd HH:mm:ss'
+        $logLine = "$timestamp active-response/bin/windows-remove-malicious.cmd: $msg"
+
+        $candidatePaths = @(
+            $Global:ARLogPath,
+            "C:\Program Files (x86)\ossec-agent\active-response\active-responses.log",
+            (Join-Path $PSScriptRoot "..\active-response\active-responses.log"),
+            (Join-Path $PSScriptRoot "..\active-responses.log"),
+            (Join-Path $PSScriptRoot "active-responses.log")
+        )
+
+        foreach ($p in $candidatePaths) {
+            if (-not $p) { continue }
+            try {
+                $dir = [System.IO.Path]::GetDirectoryName($p)
+                if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+                    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+                }
+
+                # Use FileShare.ReadWrite so we can write even if wazuh-agent has the file open
+                $stream = [System.IO.File]::Open($p, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+                $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::UTF8)
+                $writer.WriteLine($logLine)
+                $writer.Flush()
+                $writer.Close()
+                $stream.Close()
+                break
+            } catch {}
+        }
+
+        # 2. Write to Windows Application Event Log (picked up natively by Wazuh eventchannel)
+        try {
+            if (-not [System.Diagnostics.EventLog]::SourceExists("Wazuh-ActiveResponse")) {
+                [System.Diagnostics.EventLog]::CreateEventSource("Wazuh-ActiveResponse", "Application")
+            }
+            [System.Diagnostics.EventLog]::WriteEntry("Wazuh-ActiveResponse", $logLine, [System.Diagnostics.EventLogEntryType]::Information, 12002)
+        } catch {}
+    } catch {}
 }
 
-# ─── 1. Read JSON from STDIN ───────────────────────────────────────────────
-$inputJson = [Console]::In.ReadLine()
+# ─── 1. Read JSON from STDIN / Arguments / Pipeline ─────────────────────────
+$inputJson = $null
+
+try {
+    $pipeInput = @($input)
+    if ($pipeInput.Count -gt 0) {
+        $inputJson = $pipeInput -join "`n"
+    }
+} catch {}
+
 if ([string]::IsNullOrWhiteSpace($inputJson)) {
-    $inputJson = Read-Host
+    try {
+        $stdin = [Console]::In
+        $inputJson = $stdin.ReadToEnd()
+    } catch {}
 }
+
 if ([string]::IsNullOrWhiteSpace($inputJson)) {
+    try {
+        $inputJson = [Console]::In.ReadLine()
+    } catch {}
+}
+
+if ([string]::IsNullOrWhiteSpace($inputJson)) {
+    if ($args.Count -gt 0) {
+        $inputJson = $args[0]
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($inputJson)) {
+    Write-ARLog "Error: No input JSON received from Wazuh."
     exit 0
 }
 
 try {
     $data = $inputJson | ConvertFrom-Json
-    if ($data -is [string]) { $data = $data | ConvertFrom-Json }
+    if ($data -is [string]) {
+        $data = $data | ConvertFrom-Json
+    }
 } catch {
+    Write-ARLog "Error parsing JSON payload: $_"
     exit 0
+}
+
+# Normalize alert object (handles AR wrapper, OpenSearch _source, and direct alert formats)
+$alert = if ($data.parameters.alert) {
+    $data.parameters.alert
+} elseif ($data._source) {
+    $data._source
+} else {
+    $data
 }
 
 # ─── 2. Extract Target File Path from Alert Payload ────────────────────────
 $targetPath = $null
 
 # Priority 1: FIM Syscheck
-if ($data.parameters.alert.syscheck.path) {
-    $targetPath = $data.parameters.alert.syscheck.path
+if ($alert.syscheck.path) {
+    $targetPath = $alert.syscheck.path
 }
-# Priority 2: Sysmon Event 11, 15, 29 (targetFilename)
-elseif ($data.parameters.alert.data.win.eventdata.targetFilename) {
-    $targetPath = $data.parameters.alert.data.win.eventdata.targetFilename
+elseif ($alert.syscheck.file) {
+    $targetPath = $alert.syscheck.file
+}
+elseif ($alert.file) {
+    $targetPath = $alert.file
+}
+# Priority 2: Sysmon Event 11, 15, 26, 29 (targetFilename)
+elseif ($alert.data.win.eventdata.targetFilename) {
+    $targetPath = $alert.data.win.eventdata.targetFilename
+}
+elseif ($alert.data.win.eventdata.TargetFilename) {
+    $targetPath = $alert.data.win.eventdata.TargetFilename
 }
 # Priority 3: Sysmon Event 1 Process Create (image)
-elseif ($data.parameters.alert.data.win.eventdata.image) {
-    $targetPath = $data.parameters.alert.data.win.eventdata.image
+elseif ($alert.data.win.eventdata.image) {
+    $targetPath = $alert.data.win.eventdata.image
+}
+elseif ($alert.data.win.eventdata.Image) {
+    $targetPath = $alert.data.win.eventdata.Image
 }
 # Priority 4: extra_args
 elseif ($data.parameters.extra_args -and $data.parameters.extra_args.Count -gt 0) {
@@ -62,12 +142,15 @@ if ([string]::IsNullOrWhiteSpace($targetPath)) {
     exit 0
 }
 
-# Strip ADS like :Zone.Identifier
+# Normalize multiple backslashes (e.g. C:\\Users\\... -> C:\Users\...)
+$targetPath = [System.Text.RegularExpressions.Regex]::Replace($targetPath, '(?<!^)\\{2,}', '\')
+
+# Strip ADS (Alternate Data Stream) suffix like :Zone.Identifier
 if ($targetPath -match '^(.*?):[a-zA-Z0-9_\.]+$') {
     $targetPath = $matches[1]
 }
 
-# Clean quotes
+# Clean surrounding quotes and whitespace
 $targetPath = $targetPath.Trim().Trim('"').Trim("'")
 
 # Resolve 8.3 short paths (e.g. TUMMMM~1) to full canonical paths
@@ -82,6 +165,12 @@ if (-not (Test-Path -LiteralPath $targetPath)) {
     exit 0
 }
 
+# ─── Safety Guard: Never delete core OS binaries or critical system paths ────
+if ($targetPath -match '(?i)^[a-z]:\\windows\\(system32|syswow64|winsxs)\\') {
+    Write-ARLog "CRITICAL SAFETY GUARD: Refusing to delete protected system file: $targetPath"
+    exit 0
+}
+
 # ─── 3. Calculate Cryptographic Hashes ─────────────────────────────────────
 try {
     $computedSha256 = (Get-FileHash -LiteralPath $targetPath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower()
@@ -92,48 +181,58 @@ try {
 }
 
 # ─── 4. Hash Verification against MISP Database ───────────────────────────
-# Deletion MUST match hash only.
 $hashMatched = $false
 $threatLabel = "Malicious IOC"
 
-# Candidate paths for misp_hash.txt synced from Manager
-$mispCandidates = @(
-    "$env:ProgramFiles(x86)\ossec-agent\shared\misp_hash.txt",
-    "$env:ProgramFiles\ossec-agent\shared\misp_hash.txt",
-    "$env:ProgramData\ossec-agent\shared\misp_hash.txt",
-    (Join-Path (Split-Path $PSScriptRoot -Parent) "shared\misp_hash.txt"),
-    (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "shared\misp_hash.txt")
-)
+$ruleId = [string]$alert.rule.id
+$ruleGroups = @($alert.rule.groups)
+$confirmedHashRules = @('100055', '100056', '100057', '100300', '100301', '100304', '100305', '100306', '100307', '120021', '120024', '120025', '120064', '180030', '180031')
+$parsedRuleId = 0
+[int]::TryParse($ruleId, [ref]$parsedRuleId) | Out-Null
 
-$mispFile = $mispCandidates | Where-Object { Test-Path -Path $_ } | Select-Object -First 1
+# Priority 4.1 Fast-Path: Did the alert originate from a confirmed hash rule on Wazuh Manager?
+if ($ruleId -in $confirmedHashRules -or ($parsedRuleId -ge 180000 -and $parsedRuleId -le 189999) -or ($ruleGroups -contains 'misp_sysmon_hash_match') -or ($ruleGroups -contains 'misp_fim_hash_match')) {
+    $hashMatched = $true
+    $threatLabel = "MISP IOC Hash Match (Rule $ruleId)"
+}
 
-if ($mispFile) {
-    $matchLine = Get-Content -Path $mispFile | Where-Object {
-        $trimmed = $_.Trim().ToLower()
-        $trimmed.StartsWith($computedSha256) -or $trimmed.StartsWith($computedMd5)
-    } | Select-Object -First 1
-
-    if ($matchLine) {
+# Priority 4.2: Alert Hashes string match (Supports both Sysmon hashes and hash field)
+if (-not $hashMatched) {
+    $alertHashes = [string]$alert.data.win.eventdata.hashes
+    if ([string]::IsNullOrWhiteSpace($alertHashes)) {
+        $alertHashes = [string]$alert.data.win.eventdata.hash
+    }
+    if ($alertHashes -and ($alertHashes.ToLower() -match $computedSha256 -or $alertHashes.ToLower() -match $computedMd5)) {
         $hashMatched = $true
-        $threatLabel = $matchLine
+        $threatLabel = "Alert Hashes Match ($computedSha256)"
     }
 }
 
-# Fallback check: Did the alert itself originate from a confirmed hash rule?
+# Priority 4.3 Fallback: Streaming check in misp_hash.txt if not matched above
 if (-not $hashMatched) {
-    $ruleId = [string]$data.parameters.alert.rule.id
-    $confirmedHashRules = @('100055', '100056', '100057', '100300', '100301', '120021', '120024', '120025', '120064')
-    if ($ruleId -in $confirmedHashRules) {
-        # Rule itself already confirmed hash in Wazuh manager
-        $hashMatched = $true
-    }
-    # Check if hashes string in alert matches computed hash
-    $alertHashes = [string]$data.parameters.alert.data.win.eventdata.hashes
-    if ($alertHashes -and ($alertHashes.ToLower() -match $computedSha256 -or $alertHashes.ToLower() -match $computedMd5)) {
-        # Check if known test or misp hash
-        if ($computedSha256 -eq "4a60aa39fdad2a06b72a6163b693f9a4f3bee401ee33c7db78f5e04ef6df20c2") {
-            $hashMatched = $true
-            $threatLabel = "4a60aa39fdad2a06b72a6163b693f9a4f3bee401ee33c7db78f5e04ef6df20c2:donkung"
+    $mispCandidates = @(
+        "$env:ProgramFiles(x86)\ossec-agent\shared\misp_hash.txt",
+        "$env:ProgramFiles\ossec-agent\shared\misp_hash.txt",
+        "$env:ProgramData\ossec-agent\shared\misp_hash.txt",
+        "C:\Program Files (x86)\ossec-agent\shared\misp_hash.txt",
+        (Join-Path (Split-Path $PSScriptRoot -Parent) "shared\misp_hash.txt"),
+        (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) "shared\misp_hash.txt"),
+        (Join-Path $PSScriptRoot "misp_hash.txt")
+    )
+    $mispFile = $mispCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+    if ($mispFile) {
+        try {
+            foreach ($line in [System.IO.File]::ReadLines($mispFile)) {
+                $trimmed = $line.Trim().ToLower()
+                if ($trimmed.StartsWith($computedSha256) -or $trimmed.StartsWith($computedMd5)) {
+                    $hashMatched = $true
+                    $threatLabel = $line
+                    break
+                }
+            }
+        } catch {
+            Write-ARLog "Error reading misp_hash.txt: $_"
         }
     }
 }
@@ -146,10 +245,9 @@ if (-not $hashMatched) {
 
 # ─── 5. Terminate Any Process Locking the Target File ──────────────────────
 try {
-    $targetLeaf = [System.IO.Path]::GetFileName($targetPath).ToLower()
     $runningProcs = Get-Process | Where-Object {
         try {
-            ($_.Path -and $_.Path.ToLower() -eq $targetPath.ToLower()) -or ($_.Name.ToLower() -eq [System.IO.Path]::GetFileNameWithoutExtension($targetLeaf))
+            ($_.Path -and $_.Path.ToLower() -eq $targetPath.ToLower())
         } catch { $false }
     }
     foreach ($p in $runningProcs) {
