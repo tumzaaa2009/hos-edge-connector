@@ -69,14 +69,24 @@ is_public() { python3 - "$1" <<'PYEOF' 2>/dev/null || echo 0
 import sys, ipaddress
 try:
     ip = ipaddress.ip_address(sys.argv[1])
-    # private/loopback/link-local only. TEST-NET ranges (192.0.2.0/24,
-    # 198.51.100.0/24, 203.0.113.0/24) are treated as BLOCKABLE so that
-    # lab/C2 simulations work correctly.
-    blocked_internal = (ip.is_loopback or ip.is_link_local or
+    # Exclude private, loopback, link-local, multicast, reserved, CGNAT/Cloud internal (100.64.0.0/10),
+    # TEST-NETs, and well-known public DNS resolvers to prevent self-DoS.
+    public_dns = {
+        ipaddress.ip_address('8.8.8.8'),
+        ipaddress.ip_address('8.8.4.4'),
+        ipaddress.ip_address('1.1.1.1'),
+        ipaddress.ip_address('1.0.0.1'),
+        ipaddress.ip_address('9.9.9.9')
+    }
+    blocked_internal = (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or
+                        ip in public_dns or
                         ip in ipaddress.ip_network('10.0.0.0/8') or
                         ip in ipaddress.ip_network('172.16.0.0/12') or
                         ip in ipaddress.ip_network('192.168.0.0/16') or
-                        ip in ipaddress.ip_network('169.254.0.0/16'))
+                        ip in ipaddress.ip_network('169.254.0.0/16') or
+                        ip in ipaddress.ip_network('100.64.0.0/10') or
+                        ip in ipaddress.ip_network('198.51.100.0/24') or
+                        ip in ipaddress.ip_network('203.0.113.0/24'))
     print(0 if blocked_internal else 1)
 except Exception:
     print(0)
@@ -108,7 +118,23 @@ if command -v ss >/dev/null 2>&1; then
 fi
 while IFS= read -r ns; do
     [[ -n "$ns" && "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && REGULATOR_SAFE_IPS+=("$ns")
-done < <(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
+done < <(grep -hE '^nameserver' /etc/resolv.conf /run/systemd/resolve/resolv.conf /run/systemd/resolve/stub-resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
+if command -v resolvectl >/dev/null 2>&1; then
+    while IFS= read -r rns; do
+        [[ -n "$rns" && "$rns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && REGULATOR_SAFE_IPS+=("$rns")
+    done < <(resolvectl status 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
+fi
+
+# Discover APT Mirrors & Docker / GitHub Registry IPs to prevent outbound build/update block
+SAFE_REPO_HOSTS=("registry-1.docker.io" "auth.docker.io" "production.cloudflare.docker.com" "index.docker.io" "ghcr.io" "github.com" "objects.githubusercontent.com")
+while IFS= read -r apt_host; do
+    [ -n "$apt_host" ] && SAFE_REPO_HOSTS+=("$apt_host")
+done < <(grep -rhE 'https?://[^/ ]+' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null | sed -E 's|.*https?://([^/: ]+).*|\1|' | sort -u)
+for rhost in "${SAFE_REPO_HOSTS[@]}"; do
+    while IFS= read -r repo_ip; do
+        [ -n "$repo_ip" ] && REGULATOR_SAFE_IPS+=("$repo_ip")
+    done < <(getent ahostsv4 "$rhost" 2>/dev/null | awk '{print $1}' | sort -u)
+done
 
 # Discover Wazuh Manager / Cluster to prevent accidental C2 block
 while IFS= read -r mgr; do
