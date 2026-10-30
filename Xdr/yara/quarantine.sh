@@ -19,7 +19,7 @@ if [ "$ALERT_AGENT_ID" != "000" ] && [ -f /var/ossec/bin/wazuh-analysisd ]; then
     exit 0
 fi
 
-FILEPATH=$(echo "$INPUT_JSON" | jq -r '.parameters.alert.syscheck.path // .parameters.extra_args[0] // empty' 2>/dev/null)
+FILEPATH=$(echo "$INPUT_JSON" | jq -r '.parameters.alert.syscheck.path // .parameters.alert.data.file // .parameters.alert.data.audit.file.name // .parameters.alert.data.audit.exe // .parameters.extra_args[0] // empty' 2>/dev/null)
 
 if [ -z "$FILEPATH" ] || [ "$FILEPATH" == "null" ]; then
     echo "$(date '+%Y/%m/%d %H:%M:%S') quarantine.sh: [ERROR] No valid file path provided" >> "$LOG_FILE" 2>/dev/null || true
