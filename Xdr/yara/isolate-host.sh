@@ -53,10 +53,11 @@ while IFS= read -r mgr; do
     fi
 done < <(grep -oP '<address>\K[^<]+' /var/ossec/etc/ossec.conf 2>/dev/null || true)
 
-# 5. Discover DNS Nameservers
+# 5. Discover DNS Nameservers — Allow only port 53 (not full access)
+DNS_SERVERS=()
 while IFS= read -r ns; do
-    [[ -n "$ns" && "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && DYNAMIC_ALLOW_IPS+=("$ns")
-done < <(grep -E '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
+    [[ -n "$ns" && "$ns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && DNS_SERVERS+=("$ns")
+done < <(grep -hE '^nameserver' /etc/resolv.conf /run/systemd/resolve/resolv.conf /run/systemd/resolve/stub-resolv.conf 2>/dev/null | awk '{print $2}' | sort -u)
 
 # 6. Optional Environmental Subnets (if defined)
 for extra in ${SOC_SUBNETS:-}; do
@@ -83,13 +84,49 @@ if [ -n "$INPUT" ]; then
 fi
 [ -z "$ACTION" ] && ACTION="add"
 
-# Safeguard: Do not isolate Manager if alert originated from a remote agent
+# ─── Safeguard 1: Do not isolate Manager if alert originated from a remote agent ───
 ALERT_AGENT_ID=$(echo "$INPUT" | python3 -c "import sys, json; print(json.load(sys.stdin).get('parameters',{}).get('alert',{}).get('agent',{}).get('id','000'))" 2>/dev/null || echo "000")
 if [ "$ALERT_AGENT_ID" != "000" ] && [ -f /var/ossec/bin/wazuh-analysisd ]; then
     log_line "Safeguard: Skipped isolate-host on Manager for remote agent.id=$ALERT_AGENT_ID."
     log_end
     exit 0
 fi
+
+# ─── Safeguard 2: Never auto-isolate Tier-0 Critical Servers (HIS/DB/PACS) ───
+# These hosts require Human-in-the-Loop approval via SOAR/n8n before isolation.
+# Add hostnames or Agent IDs of critical servers here:
+PROTECTED_HOSTNAMES="MophRh4"
+PROTECTED_AGENT_IDS="001"
+# PROTECTED_IPS can be added if needed: PROTECTED_IPS="192.168.0.x"
+
+CURRENT_HOSTNAME=$(hostname 2>/dev/null || echo "unknown")
+for ph in $PROTECTED_HOSTNAMES; do
+    if [ "$CURRENT_HOSTNAME" = "$ph" ]; then
+        log_line "Safeguard: BLOCKED isolate-host on Tier-0 critical server ($CURRENT_HOSTNAME). Requires SOC approval."
+        log_json "$ACTION" "BLOCKED_TIER0"
+        log_end
+        exit 0
+    fi
+done
+for pa in $PROTECTED_AGENT_IDS; do
+    if [ "$ALERT_AGENT_ID" = "$pa" ]; then
+        log_line "Safeguard: BLOCKED isolate-host for Tier-0 Agent ID=$ALERT_AGENT_ID ($CURRENT_HOSTNAME). Requires SOC approval."
+        log_json "$ACTION" "BLOCKED_TIER0"
+        log_end
+        exit 0
+    fi
+done
+
+# ─── Safeguard 3: Block isolation if critical daemons are running ───
+CRITICAL_DAEMON_REGEX="^(mysqld|mariadb|postgres|postmaster|oracle|hisservice|his-.*)$"
+for daemon_check in $(ps -eo comm= 2>/dev/null | sort -u); do
+    if [[ "$daemon_check" =~ $CRITICAL_DAEMON_REGEX ]]; then
+        log_line "Safeguard: BLOCKED isolate-host — critical daemon '$daemon_check' detected on $(hostname). Requires SOC approval."
+        log_json "$ACTION" "BLOCKED_CRITICAL_DAEMON"
+        log_end
+        exit 0
+    fi
+done
 
 if [ "$ACTION" = "add" ]; then
     # 1. Create or reset SOC_ISOLATE chain
@@ -107,10 +144,17 @@ if [ "$ACTION" = "add" ]; then
         iptables -A SOC_ISOLATE -s "$ip" -j ACCEPT 2>/dev/null
     done
 
-    # 5. Allow Local Subnets
-    for net in "${LOCAL_SUBNETS[@]}"; do
-        iptables -A SOC_ISOLATE -d "$net" -j ACCEPT 2>/dev/null
+    # 4b. Allow DNS (port 53 only) to internal DNS servers — no full IP access
+    for dns in "${DNS_SERVERS[@]}"; do
+        iptables -A SOC_ISOLATE -d "$dns" -p udp --dport 53 -j ACCEPT 2>/dev/null
+        iptables -A SOC_ISOLATE -d "$dns" -p tcp --dport 53 -j ACCEPT 2>/dev/null
+        iptables -A SOC_ISOLATE -s "$dns" -p udp --sport 53 -j ACCEPT 2>/dev/null
+        iptables -A SOC_ISOLATE -s "$dns" -p tcp --sport 53 -j ACCEPT 2>/dev/null
     done
+
+    # 5. REMOVED: Local Subnet allow — intentionally blocked to prevent Lateral Movement
+    # Isolated host must NOT communicate with other hosts on the same subnet.
+    # Only Wazuh Manager, DNS, SSH management, and Gateway are allowed above.
 
     # 6. Strict Anti-Exfiltration: DROP all remaining outbound & forwarded packets
     iptables -A SOC_ISOLATE -j DROP
@@ -134,7 +178,7 @@ if [ "$ACTION" = "add" ]; then
     fi
 
     log_json "$ACTION" "ISOLATED"
-    log_line "ISOLATED: Dynamic Regulator containment activated. Allowed Management IPs: [${DYNAMIC_ALLOW_IPS[*]}], Subnets: [${LOCAL_SUBNETS[*]}]. All unauthorized exfiltration severed."
+    log_line "ISOLATED: Dynamic Regulator containment activated. Allowed Management IPs: [${DYNAMIC_ALLOW_IPS[*]}], DNS (port 53 only): [${DNS_SERVERS[*]}]. Local subnet access BLOCKED (anti-lateral-movement)."
 elif [ "$ACTION" = "delete" ]; then
     # un-isolate: flush chain and detach
     iptables -D OUTPUT -j SOC_ISOLATE 2>/dev/null || true
