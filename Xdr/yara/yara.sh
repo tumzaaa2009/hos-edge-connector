@@ -43,9 +43,9 @@ except Exception:
     fi
 }
 
-FILEPATH=$(json_extract '.parameters.alert.syscheck.path')
+FILEPATH=$(json_extract '.parameters.alert.syscheck.path // .parameters.alert.data.file // .parameters.alert.data.audit.file.name // .parameters.alert.data.audit.exe')
 if [ "$FILEPATH" == "null" ] || [ -z "$FILEPATH" ]; then
-    echo "$(date -Is) yara.sh: [DEBUG] No path in syscheck, checking extra_args." >> "$LOGFILE"
+    echo "$(date -Is) yara.sh: [DEBUG] No path in syscheck/audit/data.file, checking extra_args." >> "$LOGFILE"
     FILEPATH=$(json_extract '.parameters.extra_args[0]')
 fi
 
@@ -190,25 +190,44 @@ if [ -n "$CLEAN_YARA_RESULT" ] && [ "$EXIT_CODE" -eq 0 ]; then
         logger -p local6.warn -t wazuh_yara -- \
         "{\"event\":\"yara\",\"action\":\"quarantine_skipped\",\"level\":\"WARN\",\"reason\":\"protected_system_path\",\"file\":\"$ABS_FILE\"}"
     else
-        # Safe Quarantine: Move to /var/ossec/quarantine/ with 0000 permissions (Reversible, Forensic-ready)
-        QUARANTINE_DIR="/var/ossec/quarantine"
-        mkdir -p "$QUARANTINE_DIR" 2>/dev/null
-        chmod 700 "$QUARANTINE_DIR" 2>/dev/null
-        TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
-        DEST="$QUARANTINE_DIR/${TIMESTAMP}_${FILENAME}"
+        # Verify SHA256 (or MD5 fallback) against CDB list (misp_hash / misp_hash.txt) before quarantining/deleting
+        MISP_HASH_CONFIRMED=0
+        for hfile in "/var/ossec/etc/lists/misp_hash" "/var/ossec/etc/shared/misp_hash.txt" "/var/ossec/etc/shared/default/misp_hash.txt"; do
+            if [ -f "$hfile" ]; then
+                if grep -qiE "^(${SHA256}|${MD5}):" "$hfile" 2>/dev/null; then
+                    MISP_HASH_CONFIRMED=1
+                    break
+                fi
+            fi
+        done
 
-        mv -f "$ABS_FILE" "$DEST" 2>/dev/null
-        chmod 0000 "$DEST" 2>/dev/null
+        if [ "$MISP_HASH_CONFIRMED" -eq 1 ]; then
+            # Safe Quarantine: Move to /var/ossec/quarantine/ with 0000 permissions (Reversible, Forensic-ready)
+            QUARANTINE_DIR="/var/ossec/quarantine"
+            mkdir -p "$QUARANTINE_DIR" 2>/dev/null
+            chmod 700 "$QUARANTINE_DIR" 2>/dev/null
+            TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+            DEST="$QUARANTINE_DIR/${TIMESTAMP}_${FILENAME}"
 
-        if [ -f "$DEST" ] && [ ! -f "$ABS_FILE" ]; then
-            echo "$(date -Is) yara.sh: [DEBUG] File safely quarantined to $DEST" >> "$LOGFILE"
-            echo "$(date -Is) wazuh-yara: src=$ABS_FILE dest=$DEST sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT src_ip=$SRC_IP user=$DETECT_USER cdb_format=$SHA256:$YARA_CLEAN_FORMAT" >> "$LOGFILE"
-            logger -p local6.notice -t wazuh_yara -- \
-            "{\"event\":\"yara\",\"action\":\"quarantined\",\"level\":\"INFO\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"src\":\"$ABS_FILE\",\"dest\":\"$DEST\",\"sha256\":\"$SHA256\"}"
+            mv -f "$ABS_FILE" "$DEST" 2>/dev/null
+            chmod 0000 "$DEST" 2>/dev/null
+
+            if [ -f "$DEST" ] && [ ! -f "$ABS_FILE" ]; then
+                echo "$(date -Is) yara.sh: [DEBUG] CDB Hash Confirmed. File safely quarantined to $DEST" >> "$LOGFILE"
+                echo "$(date -Is) wazuh-yara: src=$ABS_FILE dest=$DEST sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT src_ip=$SRC_IP user=$DETECT_USER cdb_format=$SHA256:$YARA_CLEAN_FORMAT" >> "$LOGFILE"
+                logger -p local6.notice -t wazuh_yara -- \
+                "{\"event\":\"yara\",\"action\":\"quarantined\",\"level\":\"INFO\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"src\":\"$ABS_FILE\",\"dest\":\"$DEST\",\"sha256\":\"$SHA256\"}"
+            else
+                echo "$(date -Is) yara.sh: [ERROR] Failed to quarantine file." >> "$LOGFILE"
+                logger -p local6.err -t wazuh_yara -- \
+                "{\"event\":\"yara\",\"action\":\"quarantine_failed\",\"level\":\"ERROR\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\",\"src_ip\":\"$SRC_IP\",\"user\":\"$DETECT_USER\"}"
+            fi
         else
-            echo "$(date -Is) yara.sh: [ERROR] Failed to quarantine file." >> "$LOGFILE"
-            logger -p local6.err -t wazuh_yara -- \
-            "{\"event\":\"yara\",\"action\":\"quarantine_failed\",\"level\":\"ERROR\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\",\"src_ip\":\"$SRC_IP\",\"user\":\"$DETECT_USER\"}"
+            # False Positive Protection: Hash not in MISP CDB list -> Alert only (Rule 100502, or Manager CDB rule 100501 if Manager list is newer), do NOT delete file
+            echo "$(date -Is) yara.sh: [INFO] YARA match on $ABS_FILE ($YARA_CLEAN_FORMAT) but SHA256=$SHA256 not in local misp_hash. Preserving file (Alert Only)." >> "$LOGFILE"
+            echo "$(date -Is) wazuh-yara: src=$ABS_FILE dest=DETECTED_UNCONFIRMED sha256=$SHA256 md5=$MD5 yara_match=$YARA_CLEAN_FORMAT src_ip=$SRC_IP user=$DETECT_USER cdb_format=$SHA256:$YARA_CLEAN_FORMAT" >> "$LOGFILE"
+            logger -p local6.notice -t wazuh_yara -- \
+            "{\"event\":\"yara\",\"action\":\"detected_unconfirmed\",\"level\":\"INFO\",\"rule\":\"$YARA_CLEAN_FORMAT\",\"file\":\"$ABS_FILE\",\"sha256\":\"$SHA256\",\"md5\":\"$MD5\",\"src_ip\":\"$SRC_IP\",\"user\":\"$DETECT_USER\"}"
         fi
     fi
 
